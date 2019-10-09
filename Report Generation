@@ -1,0 +1,256 @@
+import csv
+import pandas as pd
+from matplotlib import pyplot as plt
+from datetime import date,timedelta
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from pandas.plotting import table
+from PyPDF2 import PdfFileMerger
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from mpmath import fdiv
+
+scope = ["https://spreadsheets.google.com/feeds",'https://www.googleapis.com/auth/spreadsheets',"https://www.googleapis.com/auth/drive.file","https://www.googleapis.com/auth/drive"]
+
+creds = ServiceAccountCredentials.from_json_keyfile_name('creds.json',scope)
+
+client = gspread.authorize(creds)
+
+sheet = client.open('PythonWorkoutLog').sheet1
+
+data = sheet.get_all_values()
+headers = data.pop(0)
+
+
+df = pd.DataFrame(data,columns = headers)
+df['Date'] = pd.to_datetime(df['Date'])
+df['Reps'] = pd.to_numeric(df['Reps'])
+df['Weight'] = pd.to_numeric(df['Weight'])
+
+Reps = df['Reps']
+Exercise = df['Exercise']
+Category = df['Category']
+
+Exercises = list(Exercise.unique())
+
+
+tier1 = ['Barbell Squat', 'Flat Barbell Bench Press','Deadlift','Overhead Press']
+tier2 = ['Close Grip Barbell Bench Press','Barbell Front Squat','Snatch Grip Deadlift']
+
+TierList = {'Tier 1': tier1,'Tier 2':tier2}
+
+today = date.today()
+
+
+
+
+
+def ExerciseList(x):
+	print(df.loc[df['Category'] == x, 'Exercise'].unique())
+
+def findExercise(x,y):
+	print(df.loc[(df[weight] >= x) & (df['Exercise'] == y)])
+
+def ExerciseDateWeeks(x):
+	df['Date'] = pd.to_datetime(df['Date'])
+	return df.loc[df['Date'] >= (today - relativedelta(weeks= x))]
+
+def ExerciseDateDays(x):
+	df['Date'] = pd.to_datetime(df['Date'])
+	return df.loc[df['Date'] >= (today - relativedelta(days= x))]
+
+def ExerciseDateMonths(x):
+	df['Date'] = pd.to_datetime(df['Date'])
+	return df.loc[df['Date'] >= (today - relativedelta(months= x))]
+
+
+
+def totalVolume(x):
+	df['Date'] = pd.to_datetime(df['Date'])
+	dateRange = df.loc[df['Date'] >= (today - relativedelta(months= x))]
+	bench = dateRange.loc[dateRange['Exercise'] == 'Flat Barbell Bench Press']
+	volume = bench['Weight'] * bench['Reps']
+	plt.plot(bench['Date'],volume)
+	plt.ylim(ymin = 0)
+	plt.show()
+	
+
+def INOL(maxWeight,reps,weight):
+	if weight == 0 or maxWeight == 0:
+		return reps/100
+	elif maxWeight == weight:
+		return 1
+	elif maxWeight == 1:
+		return 1
+	else:
+		x = reps/(100.0-(100.0*(weight/maxWeight)))
+		return x
+
+def giveReps(maxWeight,x,weight):
+	multiplier = 100.0-100.0*(weight/maxWeight)
+	InolReps = x * multiplier
+	return InolReps
+
+def giveWeight(maxWeight,reps,inol):
+	givenWeight = (inol*maxWeight)*((100*inol)-reps)/(100*inol)
+	setWeight = givenWeight / inol
+	return setWeight
+
+def maxCalculator(reps,weight):
+	assumedMax1 = (weight * reps * .033) + weight
+	assumedMax2 = weight * (1+ (reps/30))
+	assumedMax3 = 100 * weight / (101.3 - 2.67123 * reps)
+	assumedMax4 = (weight) * (reps**.1)
+	averageMax = (assumedMax4 + assumedMax3 + assumedMax2 + assumedMax1) / 4
+	averageMax = int(round(averageMax))
+	return averageMax
+
+
+
+def MaxRepGrid(x):
+	newDF = df.loc[df['Exercise'] == x]
+	maxGrid = newDF.loc[newDF.groupby('Reps')['Weight'].idxmax()]
+	maxGrid = maxGrid.drop('Category', axis = 1)
+	maxGrid['Date'] = maxGrid['Date'].dt.strftime('%m-%d-%Y')
+	repList = []
+	weightList = []
+	assumedMax = []
+	inol = []
+	for i in range(len(maxGrid)):
+		repList.append(maxGrid.iloc[i]['Reps'])
+		weightList.append(maxGrid.iloc[i]['Weight'])
+	for i in range(len(weightList)):
+		assumedMax.append(maxCalculator(repList[i],weightList[i]))
+	maxGrid['Assumed Max'] = assumedMax
+	for i in range(len(maxGrid)):
+		inol.append(INOL(assumedMax[i],repList[i],weightList[i]))
+	inol = [round(i,2) for i in inol]
+	maxGrid['INOL'] = inol
+	return maxGrid
+
+
+def reportPackage(x):
+	pdfs = []
+	for i in x:
+		fig, ax = plt.subplots()
+		fig.patch.set_visible(False)
+		ax.axis('tight')
+		ax.axis('off')
+		ax.table(cellText = MaxRepGrid(i).values, colLabels = MaxRepGrid(i).columns, loc = 'center')
+		plt.tight_layout()
+		plt.savefig(str(i +'.pdf'))
+		pdfs.append((str(i)+'.pdf'))
+	tierKey = str([number for number, name in TierList.items() if name == x])
+	merger = PdfFileMerger()
+	for pdf in pdfs:
+		merger.append(pdf)
+	fileName = 'Report Package.pdf'
+	merger.write(fileName)
+	merger.close()
+	return fileName
+	
+
+def sendEmail(x,y):
+	msg = MIMEMultipart()
+	msg['From'] = 'jfischerautomation@gmail.com'
+	msg['To'] = 'fischerjake98@gmail.com'
+	msg['Subject'] = 'Reports'
+	fileName = [reportPackage(x), inolAnalysis(y)]
+	for i in fileName:
+		part = MIMEBase('application','octet-stream')
+		part.set_payload(open(i,'rb').read())
+		encoders.encode_base64(part)
+		part.add_header('Content-Disposition','attachment; filename = "%s"' % i)
+		msg.attach(part)
+	
+	smtpObj = smtplib.SMTP('smtp.gmail.com', 587)
+	smtpObj.starttls()
+	smtpObj.ehlo()
+	smtpObj.login('jfischerautomation@gmail.com','Baldur245')
+	smtpObj.sendmail('jfischerautomation@gmail.com','fischerjake98@gmail.com',msg.as_string())
+	smtpObj.quit()
+
+
+def round_down(num, divisor):
+	return num-(num%divisor)
+
+MaxDict = {}
+for i in Exercises:
+	newDF = df.loc[df['Exercise'] == i]
+	maxGrid = newDF.loc[newDF.groupby('Reps')['Weight'].idxmax()]
+	repList = []
+	weightList = []
+	assumedMax = []
+	for x in range(len(maxGrid)):
+		if maxGrid.iloc[x]['Reps'] == 0:
+			repList.append(1)
+		else:
+			repList.append(maxGrid.iloc[x]['Reps'])
+		if maxGrid.iloc[x]['Weight'] == 0:
+			weightList.append(1)
+		else:
+			weightList.append(maxGrid.iloc[x]['Weight'])
+	for c in range(len(weightList)):
+		assumedMax.append(maxCalculator(repList[c],weightList[c]))
+	if len(assumedMax) == 0:
+		average = int(sum(assumedMax)/1)
+		average = round_down(average,5)
+	else:
+		average = int(sum(assumedMax) / len(assumedMax))
+		average = round_down(average,5)
+
+	if average == 0:
+		MaxDict.update({i:1})
+	else:
+		MaxDict.update({i:average})
+
+def inolAnalysis(x,y):
+	analysisFrame = df.loc[df['Date'] >= (today - relativedelta(weeks= x))]
+	analysisFrame = analysisFrame.loc[analysisFrame['Date'] <= (today - relativedelta(weeks = y))]
+	inol = []
+	repList = []
+	weightList = []
+	totalVolume = []
+	maxReference = []
+	analysisFrame = analysisFrame.reset_index()
+	for i in range(len(analysisFrame)):
+
+		if analysisFrame['Reps'][i] == 0:
+			repList.append(1)
+		else:
+			repList.append(analysisFrame.iloc[i]['Reps'])
+	for i in range(len(analysisFrame)):
+
+		if analysisFrame['Weight'][i] == 0:
+			weightList.append(1)
+		else:
+			weightList.append(analysisFrame.iloc[i]['Weight']) 
+
+	for i in range(len(analysisFrame)):
+		inol.append(INOL(MaxDict[analysisFrame['Exercise'][i]],repList[i],weightList[i]))
+	inol = [round(i,2) for i in inol]
+	for i in range(len(analysisFrame)):
+		maxReference.append(MaxDict[analysisFrame['Exercise'][i]])
+	for i in range(len(analysisFrame)):
+		totalVolume.append(weightList[i]*repList[i])
+
+	analysisFrame['INOL'] = inol
+	analysisFrame['Total Volume'] = totalVolume
+	analysisFrame = analysisFrame.groupby(['Exercise', pd.Grouper(key = 'Date',freq = 'W-MON'),'Weight']).sum().reset_index()
+	analysisFrame = analysisFrame.drop('index',axis = 1)
+	
+	fig, ax = plt.subplots()
+	fig.patch.set_visible(False)
+	ax.axis('tight')
+	ax.axis('off')
+	plt.tight_layout()
+	ax.table(cellText = analysisFrame.values, colLabels = analysisFrame.columns, loc = 'center',)
+	plt.savefig('Weekly INOL Report.pdf', bbox_inches = 'tight')
+	return 'Weekly INOL Report.pdf'
+
+inolAnalysis(12,0)
